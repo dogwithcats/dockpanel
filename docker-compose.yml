@@ -1,0 +1,31 @@
+services:
+  dockpanel:
+    build: .
+    image: dockpanel:latest
+    container_name: dockpanel
+    restart: unless-stopped
+    # Bind to localhost and put nginx/caddy (HTTPS) in front. Change to "8080:8080" only on a trusted network.
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      ADMIN_USER: admin
+      ADMIN_PASSWORD: ${DOCKPANEL_PASSWORD:?set DOCKPANEL_PASSWORD in .env}
+      # Display name of the local server (only used the first time, editable in the UI afterwards)
+      HOST_LABEL: ${DOCKPANEL_HOST_LABEL:-}
+      TRUST_PROXY: "true"
+      # Serve under a sub-path behind nginx, e.g. location /dockerpanel/ (see deploy/nginx-subpath.conf)
+      BASE_PATH: ${DOCKPANEL_BASE_PATH:-}
+      # READ_ONLY: "true"      # view-only panel
+      # ALLOW_EXEC: "false"      # disable the web terminal
+      # ALLOW_FILE_WRITE: "false" # keep the file browser read-only
+    volumes:
+      # Local Docker. Remove this line if the panel should only manage remote servers (via SSH / TLS).
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Audit log + server list (hosts.json contains SSH keys – back it up securely)
+      - dockpanel-data:/data
+    labels:
+      # The panel refuses to stop/remove itself
+      dockpanel.protected: "true"
+
+volumes:
+  dockpanel-data:
