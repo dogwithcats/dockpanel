@@ -63,6 +63,8 @@ export function FileBrowser({ active }: { active: boolean }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [open, setOpen] = useState<{ mount: string; path: string } | null>(null);
   const [canWrite, setCanWrite] = useState(true);
+  // The mount source is a single file: one entry, no directory operations
+  const [single, setSingle] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const load = useCallback(
@@ -73,8 +75,13 @@ export function FileBrowser({ active }: { active: boolean }) {
         const r = await files.list(m, p);
         setEntries(r.entries);
         setSelected(new Set());
+        const isFile = r.kind === 'file';
+        setSingle(isFile);
+        // Nothing to browse – go straight to the file
+        if (isFile && r.entries[0]) setOpen((o) => (o?.mount === m ? o : { mount: m, path: r.entries[0].name }));
       } catch (e) {
         setEntries([]);
+        setSingle(false);
         setError((e as Error).message);
       } finally {
         setLoading(false);
@@ -93,7 +100,7 @@ export function FileBrowser({ active }: { active: boolean }) {
       .then((m) => {
         setMountList(m.mounts);
         setCanWrite(m.canWrite);
-        const first = m.mounts.find((x) => x.browsable);
+        const first = m.mounts.find((x) => x.browsable && x.rw) || m.mounts.find((x) => x.browsable);
         if (first) {
           setMount(first.target);
           load(first.target, '');
@@ -104,6 +111,9 @@ export function FileBrowser({ active }: { active: boolean }) {
 
   const current = mountList?.find((m) => m.target === mount);
   const writable = canWrite && !!current?.rw;
+  // Creating, moving and deleting entries only makes sense inside a directory mount
+  const manageable = writable && !single;
+  const sourceOf = (rel: string) => (single ? current?.source : `${current?.source}/${rel}`);
 
   const enter = (e: FileEntry) => {
     if (e.type !== 'dir') return;
@@ -124,6 +134,7 @@ export function FileBrowser({ active }: { active: boolean }) {
     setMount(target);
     setPath('');
     setQuery('');
+    setOpen(null);
     load(target, '');
   };
 
@@ -253,6 +264,11 @@ export function FileBrowser({ active }: { active: boolean }) {
           {current?.source}
         </span>
         {current && !current.rw && <span className="tag warn">只读挂载</span>}
+        {single && (
+          <span className="tag" title="挂载源是单个文件：可以查看、编辑、下载和修改权限，保存时直接覆盖原文件">
+            单文件挂载
+          </span>
+        )}
 
         <span className="spacer" />
 
@@ -265,7 +281,7 @@ export function FileBrowser({ active }: { active: boolean }) {
             </button>
           )}
         </div>
-        {writable && (
+        {manageable && (
           <>
             <button className="icon-btn sm" title="新建目录" onClick={mkdir}>
               <FolderPlus size={15} />
@@ -340,7 +356,7 @@ export function FileBrowser({ active }: { active: boolean }) {
                     <div className="empty" style={{ padding: '36px 20px' }}>
                       <Folder size={26} />
                       <h4>{query ? '没有匹配的条目' : '目录为空'}</h4>
-                      <div>{query ? '试试其他关键字' : writable ? '可以上传文件或新建目录' : ''}</div>
+                      <div>{query ? '试试其他关键字' : manageable ? '可以上传文件或新建目录' : ''}</div>
                     </div>
                   </td>
                 </tr>
@@ -359,7 +375,7 @@ export function FileBrowser({ active }: { active: boolean }) {
                     }}
                   >
                     <td onClick={(ev) => ev.stopPropagation()}>
-                      {writable && e.type !== 'special' ? (
+                      {manageable && e.type !== 'special' ? (
                         <label className="check">
                           <input
                             type="checkbox"
@@ -413,11 +429,11 @@ export function FileBrowser({ active }: { active: boolean }) {
                               icon: <Download size={15} />,
                               onClick: () => window.open(files.downloadUrl(mount, rel), '_blank'),
                             },
-                            { label: '复制路径', icon: <Copy size={15} />, onClick: async () => { await copyText(`${current?.source}/${rel}`); toast('success', '已复制路径'); } },
-                            ...(writable
+                            { label: '复制宿主机路径', icon: <Copy size={15} />, onClick: async () => { await copyText(sourceOf(rel) || ''); toast('success', '已复制路径'); } },
+                            ...(writable ? [{ label: '修改权限', icon: <ShieldAlert size={15} />, onClick: () => chmod(e) }] : []),
+                            ...(manageable
                               ? [
                                   { label: '重命名', icon: <RotateCw size={15} />, onClick: () => rename(e) },
-                                  { label: '修改权限', icon: <ShieldAlert size={15} />, onClick: () => chmod(e) },
                                   { label: '', divider: true },
                                   { label: '删除', icon: <Trash2 size={15} />, danger: true, onClick: () => remove([e]) },
                                 ]

@@ -227,6 +227,8 @@ export interface FileListing {
   path: string;
   entries: FileEntry[];
   truncated: boolean;
+  /** 'file' when the mount source is a single file (e.g. -v ./nginx.conf:/etc/nginx/nginx.conf) */
+  kind: 'dir' | 'file';
 }
 
 export interface FileContent {

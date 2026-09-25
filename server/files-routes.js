@@ -52,8 +52,8 @@ filesRouter.get('/mounts', wrap(async (req, res) => {
 filesRouter.get('/entries', wrap(async (req, res) => {
   const { mount } = await context(req);
   const dir = String(req.query.path || '');
-  const { entries, truncated } = await listDir(req.docker, mount, dir);
-  res.json({ path: dir, entries, truncated });
+  const { entries, truncated, kind } = await listDir(req.docker, mount, dir);
+  res.json({ path: dir, entries, truncated, kind });
 }));
 
 filesRouter.get('/file', wrap(async (req, res) => {

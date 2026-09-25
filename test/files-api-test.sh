@@ -80,5 +80,23 @@ check "volume listed"  "$(api "$BASE/api/hosts/$HOST_ID/containers/dp-demo-files
 check "volume refused" "$(api "$BASE/api/hosts/$HOST_ID/containers/dp-demo-files-vol/files/entries?mount=/data")" '数据卷'
 check "no mounts"        "$(api "$BASE/api/hosts/$HOST_ID/containers/dp-demo-nomount/files/entries")" '没有挂载任何目录'
 
+echo "single-file mount (-v ./app.conf:/etc/app/app.conf)"
+S="$BASE/api/hosts/$HOST_ID/containers/dp-demo-singlefile/files"
+SRC=${DIR:-/tmp/dpfile}-single/app.conf
+check "listed as one file"   "$(api "$S/entries")" '"kind":"file"'
+check "named after target"   "$(api "$S/entries")" '"name":"app.conf"'
+check "read"                 "$(api "$S/file?path=app.conf")" 'worker_processes 1'
+check "write in place"       "$(api -X PUT "$S/file" -H 'content-type: application/json' -d '{"path":"app.conf","content":"worker_processes 4;\n"}')" '"ok":true'
+check "host file updated"    "$(cat "$SRC")" 'worker_processes 4'
+check "mode kept"            "$(ls -l "$SRC" | cut -c1-10)" '-rw-r-----'
+check "app container sees it" "$(docker exec dp-demo-singlefile cat /etc/app/app.conf 2>&1)" 'worker_processes 4'
+check "download name"        "$(curl -s -b "$JAR" -D - -o /dev/null "$S/download?path=app.conf" | tr -d '\r' | grep -i disposition)" "app.conf"
+check "mkdir refused"        "$(api -X POST "$S/mkdir" -H 'content-type: application/json' -d '{"path":"x"}')" '单个文件'
+check "delete refused"       "$(api -X DELETE "$S/path?path=app.conf")" '单个文件'
+check "other paths refused"  "$(api "$S/file?path=other.conf")" '单个文件'
+# vim / sed -i save by replacing the file; the panel must pick up the new file, not the stale inode
+printf 'worker_processes 8;\n' > "$SRC.new" && mv -f "$SRC.new" "$SRC"
+check "follows a replaced file" "$(api "$S/file?path=app.conf")" 'worker_processes 8'
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

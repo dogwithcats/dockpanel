@@ -11,6 +11,11 @@ import { dockerError } from './docker.js';
  *
  * Volume mounts are not supported: their data lives under the daemon's internal directory, which the helper
  * would have to know about. Use the terminal for those.
+ *
+ * A bind mount's source can be a directory or a single file (`-v ./nginx.conf:/etc/nginx/nginx.conf`).
+ * The helper mounts it at /mnt/vol either way and records which one it got (`helper.kind`):
+ *   dir  – full browser: list, edit, upload, mkdir, rename, delete
+ *   file – one entry: view, edit (written in place, see writeFile), download, chmod
  */
 
 const HELPER_LABEL = 'dockpanel.file-helper';
@@ -20,7 +25,7 @@ const EXEC_TIMEOUT = 20_000;
 /** Preferred helper images, cheapest/leanest first. $FILE_HELPER_IMAGE wins if set. */
 const CANDIDATES = ['alpine:latest', 'busybox:latest', 'debian:stable-slim', 'ubuntu:latest'];
 
-const helpers = new Map(); // key "image\u0000source" -> { container, id, refs, idleAt }
+const helpers = new Map(); // key "image\u0000source" -> { container, id, refs, idleAt, validatedAt, kind, lsFlags }
 
 setInterval(() => {
   const now = Date.now();
@@ -106,7 +111,9 @@ async function acquireHelper(docker, source) {
         Image: image,
         Cmd: ['sh', '-c', 'while true; do sleep 30; done'],
         Labels: { [HELPER_LABEL]: source },
-        HostConfig: { Binds: [`${source}:/mnt/vol:rw`], AutoRemove: false },
+        // `Mounts` rather than `Binds`: Binds would create a missing source path as an empty directory on
+        // the host, which is exactly wrong for a file that was just deleted or moved.
+        HostConfig: { Mounts: [{ Type: 'bind', Source: source, Target: '/mnt/vol', ReadOnly: false }], AutoRemove: false },
       }),
       15_000,
       '创建文件助手容器',
@@ -117,24 +124,66 @@ async function acquireHelper(docker, source) {
     throw new FileError(humanizeHelperError(err, image), err?.statusCode === 404 ? 404 : 500);
   }
 
-  const entry = { container, id: container.id, refs: 1, idleAt: Date.now(), validatedAt: Date.now() };
+  const entry = { container, id: container.id, refs: 1, idleAt: Date.now(), validatedAt: Date.now(), kind: 'dir' };
+  try {
+    entry.kind = await mountKind(entry);
+  } catch (err) {
+    await container.remove({ force: true }).catch(() => {});
+    throw err;
+  }
   helpers.set(key, entry);
   return { ...entry, release: () => release(entry) };
 }
 
+/** What the helper sees at /mnt/vol: a directory, a single file, or nothing usable. */
+async function mountKind(helper) {
+  // `(: < path)` really opens the file: on Docker Desktop a replaced file still passes `-e` but can't be read
+  const r = await sh(helper, 'if [ -d /mnt/vol ]; then echo dir; elif (: < /mnt/vol) 2>/dev/null; then echo file; else echo missing; fi', {
+    timeout: 8000,
+  });
+  const kind = r.stdout.trim();
+  if (kind === 'missing') throw new FileError('挂载的宿主机路径已不存在（可能被删除或移动）', 404);
+  return kind === 'file' ? 'file' : 'dir';
+}
+
 /**
  * True when the helper's bind mount no longer shows what the host path contains.
- * Checked lazily: only a helper whose mount looks empty is investigated further, so the common case
- * costs nothing.
+ *
+ * A bind mount pins the inode that existed when the helper started. When the host path is replaced rather
+ * than modified – a deploy script recreating a directory, or vim / `sed -i` saving a file by writing a new
+ * file and renaming it over the old one – the helper keeps looking at the old inode:
+ *   directory → shows up empty
+ *   file      → unlinked (link count 0) on Linux; "No such file" on Docker Desktop
+ * Editing an unlinked file would silently lose the change, so file mounts are checked on every use; the
+ * directory check is throttled.
  */
 async function mountWentStale(helper, ttlMs = 20_000) {
-  // Cheap in the common case: only look again once the TTL has passed.
-  if (Date.now() - helper.validatedAt < ttlMs) return false;
-  const probe = await sh(helper, 'ls -A /mnt/vol 2>/dev/null | head -1', { timeout: 5000 }).catch(() => null);
+  if (helper.kind === 'dir' && Date.now() - helper.validatedAt < ttlMs) return false;
+  const probe = await sh(
+    helper,
+    `if [ -d /mnt/vol ]; then [ -n "$(ls -A /mnt/vol 2>/dev/null | head -1)" ] && echo ok || echo empty
+elif (: < /mnt/vol) 2>/dev/null; then [ "$(stat -c %h /mnt/vol 2>/dev/null)" = 0 ] && echo gone || echo ok
+else echo gone; fi`,
+    { timeout: 5000 },
+  ).catch(() => null);
   helper.validatedAt = Date.now();
-  if (!probe || probe.stdout.trim() !== '') return false; // has content (or the probe failed) – keep it
-  return true; // an empty mount is cheap to rebuild, and silently reporting an empty directory is worse
+  const state = probe?.stdout.trim();
+  return state === 'empty' || state === 'gone'; // a helper is cheap to rebuild; stale data is not
 }
+
+/** Path inside the helper for `rel`, honouring single-file mounts (whose only entry is the file itself). */
+function helperPath(helper, mount, rel) {
+  const clean = cleanRel(rel);
+  if (helper.kind !== 'file') return clean ? `/mnt/vol/${clean}` : '/mnt/vol';
+  if (clean && clean !== mountBaseName(mount)) throw new FileError('这个挂载点是单个文件，没有其他条目', 404);
+  return '/mnt/vol';
+}
+
+function requireDir(helper, what) {
+  if (helper.kind === 'file') throw new FileError(`这个挂载点是单个文件，不能${what}，只能查看、编辑、下载和修改权限`);
+}
+
+const mountBaseName = (mount) => mount.target.split('/').filter(Boolean).pop() || 'file';
 
 function release(entry) {
   entry.refs = Math.max(0, entry.refs - 1);
@@ -145,6 +194,9 @@ function humanizeHelperError(err, image) {
   const msg = dockerError(err).message;
   if (/no such image|image .* not found|pull access denied/i.test(msg)) {
     return `找不到文件助手镜像 ${image}，请先拉取：docker pull ${image}（或用 FILE_HELPER_IMAGE 指定）`;
+  }
+  if (/bind source path does not exist/i.test(msg)) {
+    return '挂载的宿主机路径已不存在（可能被删除或移动），重建容器后再试';
   }
   if (/permission denied|not permitted|operation not permitted/i.test(msg)) {
     return `当前 Docker 用户没有创建容器的权限，无法访问文件：${msg}`;
@@ -250,31 +302,26 @@ export function resolveMount(info, mountTarget) {
 // Pin the locale so flags, sorting and date format are predictable.
 const LS_ENV = 'LC_ALL=C';
 
-/** Preferred listing flags, richest first. */
-const LS_CANDIDATES = ['ls -lAnF --time-style=+%s', 'ls -lAnF --full-time', 'ls -lAnF'];
-
 /**
- * Pick the richest `ls` form the helper supports.
- * Busybox rejects the GNU time flags on stderr, so a probe must check stdout for a real entry line.
+ * List a directory of the mount. For a single-file mount the listing is that one file, named after the
+ * mount target (so `/etc/nginx/nginx.conf` shows up as `nginx.conf`), and `kind: 'file'` tells the UI.
  */
-async function lsCommand(helper) {
-  for (const cmd of LS_CANDIDATES) {
-    const probe = await sh(helper, `cd /mnt/vol && ${LS_ENV} ${cmd} ./ 2>/dev/null`);
-    const line = probe.stdout.split('\n').find((l) => /^\s*[-bcdlps][rwxsStT-]{9}\s+\d+\s/.test(l));
-    if (line) return { cmd, gnu: /\s\d{9,}\s/.test(line) };
-  }
-  return { cmd: LS_FALLBACK, gnu: false };
-}
-
 export async function listDir(docker, mount, relPath) {
   const helper = await acquireHelper(docker, mount.source);
   try {
+    const flags = await lsFlags(helper);
+    if (helper.kind === 'file') {
+      if (cleanRel(relPath)) throw new FileError('这个挂载点是单个文件，没有子目录', 404);
+      const r = await sh(helper, `${LS_ENV} ls ${flags} -d /mnt/vol 2>&1`, { timeout: 10_000 });
+      const { entries } = parseLs(r.stdout);
+      if (r.code !== 0 || !entries.length) throw new FileError(r.stdout.trim() || '无法读取挂载的文件', 404);
+      return { entries: [{ ...entries[0], name: mountBaseName(mount) }], path: '', truncated: false, kind: 'file' };
+    }
     const dir = cleanRel(relPath) || '.';
-    const { flags } = await lsFlags(helper);
-    const r = await sh(helper, `cd /mnt/vol && cd ${q(dir)} 2>&1 && LC_ALL=C ls ${flags} ./ 2>&1`, { timeout: 20_000 });
+    const r = await sh(helper, `cd /mnt/vol && cd ${q(dir)} 2>&1 && ${LS_ENV} ls ${flags} ./ 2>&1`, { timeout: 20_000 });
     if (r.code !== 0) throw new FileError(r.stderr.trim() || r.stdout.trim() || '无法进入目录', 404);
     const { entries, truncated } = parseLs(r.stdout);
-    return { entries, path: dir === '.' ? '' : dir, truncated };
+    return { entries, path: dir === '.' ? '' : dir, truncated, kind: 'dir' };
   } finally {
     helper.release();
   }
@@ -289,9 +336,12 @@ const LS_FALLBACK = '-lAnF';
 const LS_GNU = '-lAnF --time-style=+%s';
 
 async function lsFlags(helper) {
-  const probe = await sh(helper, `cd /mnt/vol && LC_ALL=C ls ${LS_GNU} ./ 2>/dev/null`);
+  if (helper.lsFlags) return helper.lsFlags;
+  // `-d /mnt/vol` always yields one entry line, whether the mount is a directory, a file or empty
+  const probe = await sh(helper, `${LS_ENV} ls ${LS_GNU} -d /mnt/vol 2>/dev/null`);
   const hasEntry = probe.stdout.split('\n').some((l) => /^\s*[-bcdlps][rwxsStT-]{9}\s+\d+\s/.test(l));
-  return { flags: hasEntry ? LS_GNU : LS_FALLBACK };
+  helper.lsFlags = hasEntry ? LS_GNU : LS_FALLBACK;
+  return helper.lsFlags;
 }
 
 const MAX_ENTRIES = 3000;
@@ -411,13 +461,6 @@ function cleanRel(rel) {
   return clean;
 }
 
-/** Absolute path inside the helper for a path relative to the mount. */
-/** Absolute path inside the helper container for a path relative to the mount point. */
-const volPath = (rel) => {
-  const clean = cleanRel(rel);
-  return clean ? `/mnt/vol/${clean}` : '/mnt/vol';
-};
-
 export const isTextName = (name) => {
   const ext = (name.split('.').pop() || '').toLowerCase();
   return !BINARY_EXT.has(ext) && !name.endsWith('~');
@@ -433,7 +476,7 @@ const BINARY_EXT = new Set([
 export async function readFile(docker, mount, rel, maxBytes = 8 * 1024 * 1024) {
   const helper = await acquireHelper(docker, mount.source);
   try {
-    const p = volPath(rel);
+    const p = helperPath(helper, mount, rel);
     const st = await sh(helper, `stat -c '%F|%s|%a|%Y' ${q(p)} 2>&1 || (ls -ld ${q(p)} >/dev/null 2>&1 && ls -ldn ${q(p)})`, { timeout: 8000 });
     if (st.code !== 0) throw new FileError(st.stderr.trim() || '文件不存在', 404);
     const info = (await sh(helper, `test -d ${q(p)} && echo dir || echo file`)).stdout.trim();
@@ -485,19 +528,32 @@ export async function writeFile(docker, mount, rel, data) {
   if (!mount.rw) throw new FileError(`挂载点 ${mount.target} 是只读的，无法写入`);
   const helper = await acquireHelper(docker, mount.source);
   try {
-    const clean = cleanRel(rel);
-    if (!clean) throw new FileError('缺少文件路径');
-    const name = clean.slice(clean.lastIndexOf('/') + 1);
-    if (!name || name === '.' || name === '..') throw new FileError('非法文件名');
+    let script;
+    if (helper.kind === 'file') {
+      // A single-file bind mount cannot be replaced (rename over it fails with EBUSY), and replacing it
+      // would detach it from the app container anyway. Stage the upload in the helper, then overwrite the
+      // file in place – the app container sees the change immediately, and a dropped upload never leaves
+      // the real file half-written.
+      const target = helperPath(helper, mount, rel);
+      const tmp = `/tmp/dp-upload-${Date.now()}`;
+      script = `cat > ${q(tmp)} && cat ${q(tmp)} > ${q(target)}; rc=$?; rm -f ${q(tmp)}; exit $rc`;
+    } else {
+      const clean = cleanRel(rel);
+      if (!clean) throw new FileError('缺少文件路径');
+      const name = clean.slice(clean.lastIndexOf('/') + 1);
+      if (!name || name === '.' || name === '..') throw new FileError('非法文件名');
+      const dir = clean.includes('/') ? `/mnt/vol/${clean.slice(0, clean.lastIndexOf('/'))}` : '/mnt/vol';
+      // Temp file next to the target → the final `mv` is an atomic rename on the same filesystem
+      const tmp = `${dir}/.${name}.dp-tmp-${Date.now()}`;
+      // Copy the old mode so a rewrite doesn't reset permissions (e.g. an executable script)
+      const existing = await sh(helper, `stat -c %a ${q(`/mnt/vol/${clean}`)} 2>/dev/null || echo ''`);
+      const mode = /^[0-7]{3,4}$/.test(existing.stdout.trim()) ? existing.stdout.trim() : '644';
+      script = `cat > ${q(tmp)} && chmod ${mode} ${q(tmp)} && mv -f ${q(tmp)} ${q(`/mnt/vol/${clean}`)} || { rm -f ${q(tmp)}; exit 1; }`;
+    }
 
-    const tmp = `/mnt/vol/.${name}.dp-tmp-${Date.now()}`; // same dir → atomic rename on the same filesystem
-    // Copy the old mode so a rewrite doesn't reset permissions (e.g. an executable script)
-    const existing = await sh(helper, `stat -c %a ${q(`/mnt/vol/${clean}`)} 2>/dev/null || echo ''`);
-    const mode = /^[0-7]{3,4}$/.test(existing.stdout.trim()) ? existing.stdout.trim() : '644';
-
-    // Stream the new content into the helper and replace the file atomically (same filesystem)
+    // Stream the new content into the helper
     const exec = await helper.container.exec({
-      Cmd: ['sh', '-c', `cat > ${q(tmp)} && chmod ${mode} ${q(tmp)} && mv -f ${q(tmp)} ${q(`/mnt/vol/${clean}`)}`],
+      Cmd: ['sh', '-c', script],
       AttachStdin: true,
       AttachStdout: true,
       AttachStderr: true,
@@ -529,6 +585,7 @@ export async function uploadArchive(docker, mount, rel, archive, { overwrite = t
   if (!mount.rw) throw new FileError(`挂载点 ${mount.target} 是只读的，无法写入`);
   const helper = await acquireHelper(docker, mount.source);
   try {
+    requireDir(helper, '上传');
     const clean = cleanRel(rel);
     const dir = clean.includes('/') ? clean.slice(0, clean.lastIndexOf('/')) : '.';
     if (!overwrite) {
@@ -569,7 +626,7 @@ export async function downloadStream(docker, mount, rel) {
   const helper = await acquireHelper(docker, mount.source);
   let stream;
   try {
-    const p = volPath(rel);
+    const p = helperPath(helper, mount, rel);
     const isDir = (await sh(helper, `test -d ${q(p)} && echo dir || echo file`, { timeout: 8000 })).stdout.trim() === 'dir';
     if (isDir) {
       const dir = cleanRel(rel);
@@ -607,7 +664,7 @@ export async function downloadStream(docker, mount, rel) {
     }
     done();
   });
-  const name = cleanRel(rel).split('/').pop() || 'file';
+  const name = helper.kind === 'file' ? mountBaseName(mount) : cleanRel(rel).split('/').pop() || 'file';
   return { stream: pass, name, type: guessMime(name), release: done };
 }
 
@@ -622,7 +679,8 @@ export async function mkdir(docker, mount, rel, mode = '755') {
   if (!mount.rw) throw new FileError('挂载点是只读的');
   const helper = await acquireHelper(docker, mount.source);
   try {
-    await shOk(helper, `mkdir -p -m ${q(mode)} ${q(volPath(rel))}`);
+    requireDir(helper, '新建目录');
+    await shOk(helper, `mkdir -p -m ${q(mode)} ${q(helperPath(helper, mount, rel))}`);
     return { ok: true };
   } finally {
     helper.release();
@@ -641,6 +699,7 @@ export async function removePath(docker, mount, rel, { recursive = false } = {})
   if (!clean) throw new FileError('不能删除挂载根目录');
   const helper = await acquireHelper(docker, mount.source);
   try {
+    requireDir(helper, '删除');
     const p = `/mnt/vol/${clean}`;
     const script = `p=${q(p)}
 if [ ! -e "$p" ] && [ ! -L "$p" ]; then echo "文件不存在：${clean}" >&2; exit 3; fi
@@ -665,11 +724,12 @@ export async function rename(docker, mount, from, to) {
   if (!mount.rw) throw new FileError('挂载点是只读的');
   const helper = await acquireHelper(docker, mount.source);
   try {
+    requireDir(helper, '重命名');
     const cleanTo = cleanRel(to);
     if (!cleanTo) throw new FileError('缺少目标路径');
     const parent = cleanTo.includes('/') ? cleanTo.slice(0, cleanTo.lastIndexOf('/')) : '';
     if (parent) await sh(helper, `mkdir -p ${q(`/mnt/vol/${parent}`)} 2>/dev/null`);
-    await shOk(helper, `mv -- ${q(volPath(from))} ${q(`/mnt/vol/${cleanTo}`)} 2>&1`);
+    await shOk(helper, `mv -- ${q(helperPath(helper, mount, from))} ${q(`/mnt/vol/${cleanTo}`)} 2>&1`);
     return { ok: true };
   } finally {
     helper.release();
@@ -681,7 +741,7 @@ export async function chmod(docker, mount, rel, mode) {
   if (!/^[0-7]{3,4}$/.test(String(mode))) throw new FileError('权限格式无效，应为 644 / 0755 这样的形式');
   const helper = await acquireHelper(docker, mount.source);
   try {
-    await shOk(helper, `chmod ${q(mode)} ${q(volPath(rel))} 2>&1`);
+    await shOk(helper, `chmod ${q(mode)} ${q(helperPath(helper, mount, rel))} 2>&1`);
     return { ok: true };
   } finally {
     helper.release();
